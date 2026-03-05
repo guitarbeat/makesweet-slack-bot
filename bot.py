@@ -1,5 +1,6 @@
 import os
 import io
+import random
 import logging
 import requests
 from slack_bolt import App
@@ -49,6 +50,105 @@ TEMPLATE_FIELDS = {
     "flying-bear": ["image"],
     "nesting-doll": ["image-left", "image-mid", "image-right"],
 }
+
+# ============================================================
+# 🎭 PERSONALITY - co-op house energy
+# ============================================================
+
+THINKING_MESSAGES = [
+    "🎨 hold on, crafting something beautiful...",
+    "🧪 mixing the pixels in the communal kitchen...",
+    "🪄 one sec, the gif wizard is doing their thing...",
+    "🫧 brewing up something special in the back room...",
+    "🔮 consulting the house oracle... gif incoming...",
+    "🎪 the gif hamster is running on its wheel, one moment...",
+    "🌀 channeling the creative energy of the house...",
+    "🍳 cooking up a hot gif, don't touch the stove...",
+    "🧶 knitting you a gif with love and care...",
+    "🪩 the disco ball is spinning... gif loading...",
+]
+
+TIMEOUT_MESSAGES = [
+    "⏱️ the gif server fell asleep on the couch again. poke it and try in a min?",
+    "⏱️ timed out... the server is taking a nap like someone after house dinner",
+    "⏱️ gif machine is buffering harder than the house wifi. try again shortly!",
+    "⏱️ the gif gnomes are on break. they'll be back in a minute, promise",
+    "⏱️ this is taking longer than deciding whose turn it is to do dishes. try again!",
+]
+
+CONNECTION_ERROR_MESSAGES = [
+    "🔌 can't reach the gif server... did someone unplug it to charge their phone?",
+    "🔌 gif server is MIA, like that one housemate who's 'definitely coming to the meeting'",
+    "🔌 lost connection to the gif machine. it's probably restarting, give it a sec",
+    "🔌 the gif server ghosted us. classic. try again in a minute!",
+    "🔌 server's down... probably tripped the breaker again. brb",
+]
+
+GENERATION_FAILED_MESSAGES = [
+    "❌ gif machine said no 😤 try a different emoji maybe?",
+    "❌ that didn't work lol. the gif gods are displeased. try another template!",
+    "❌ gif factory had a malfunction. it's not you, it's the server",
+    "❌ nope. the gif gremlins ate this one. try again?",
+    "❌ the vibes were off and the gif couldn't manifest. try a different one!",
+]
+
+GENERIC_ERROR_MESSAGES = [
+    "😵 something broke and honestly idk what happened. try again?",
+    "😵 the gif machine had a moment. we've all been there. try again!",
+    "😵 oops. that wasn't supposed to happen. let's pretend it didn't and try again",
+    "😵 well THAT was unexpected. like finding someone else's leftovers gone. try again?",
+    "😵 a mystery error appeared! much like the mystery stain on the couch. try again!",
+]
+
+DOWNLOAD_ERROR_MESSAGES = [
+    "❌ can't grab the image... am i invited to this channel? 👉👈",
+    "❌ couldn't download that pic. make sure i'm in the channel! /invite @MakeSweet",
+    "❌ i can see there's an image but i can't touch it. i need to be invited to the channel first!",
+]
+
+SUCCESS_MESSAGES = {
+    "heart-locket": [
+        "💖 love is in the air at the co-op",
+        "💖 the locket has spoken. this is canon now",
+        "💖 putting this on the house fridge",
+        "💖 heart-locket-ified with care",
+        "💖 this belongs in the house museum",
+    ],
+    "billboard": [
+        "🏙️ your face, 40 feet tall. you're welcome",
+        "🏙️ now THAT'S a billboard worth looking at",
+        "🏙️ famous in the city. house legend status",
+        "🏙️ this is going up on the house billboard",
+        "🏙️ big picture energy",
+    ],
+    "flag": [
+        "🏳️ flying this flag at the next house meeting",
+        "🏳️ i pledge allegiance to this gif",
+        "🏳️ the official flag of the co-op, as voted by me",
+        "🏳️ let it wave, baby",
+        "🏳️ this flag goes hard",
+    ],
+    "flying-bear": [
+        "🐻 the bear has your image and it's not giving it back",
+        "🐻 fly, bear, fly! take this masterpiece to the skies",
+        "🐻 special delivery from the co-op bear",
+        "🐻 a bear. flying. with your pic. you're welcome",
+        "🐻 certified bear-approved content",
+    ],
+    "nesting-doll": [
+        "🪆 it's dolls all the way down",
+        "🪆 the nesting doll council has accepted your offering",
+        "🪆 matryo-SHKA that's cool",
+        "🪆 layers, like an onion. or a co-op house meeting agenda",
+        "🪆 you've been doll-ified. no take-backs",
+    ],
+}
+
+HOW_RESPONSES = [
+    "react to any image with one of these bad boys:\n💖 heart locket · 🏙️ billboard · 🏳️ flag · 🐻 flying bear · 🪆 nesting doll",
+    "just slap one of these emojis on a pic:\n💖 🏙️ 🏳️ 🐻 🪆\nand watch the magic happen ✨",
+    "the sacred emojis:\n💖 = heart locket\n🏙️ = billboard\n🏳️ = flag\n🐻 = flying bear\n🪆 = nesting doll\nreact to an image and i do the rest 🫡",
+]
 
 # Track processed reactions to avoid duplicates
 processed_reactions = set()
@@ -271,7 +371,7 @@ def handle_message(event, client):
         client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text="💖 🏙️ 🏳️ 🐻 🪆",
+            text=random.choice(HOW_RESPONSES),
         )
 
     except Exception as e:
@@ -327,7 +427,7 @@ def handle_reaction_added(event, client):
             thinking_msg = client.chat_postMessage(
                 channel=channel,
                 thread_ts=message_ts,
-                text="🎨 Generating GIF...",
+                text=random.choice(THINKING_MESSAGES),
             )
         except Exception:
             thinking_msg = None
@@ -339,7 +439,7 @@ def handle_reaction_added(event, client):
         if not images_info["message_images"]:
             logger.warning("Failed to download any message images")
             _update_or_post(client, channel, message_ts, thinking_msg,
-                           "❌ Couldn't download the image. Make sure I have access to this channel!")
+                           random.choice(DOWNLOAD_ERROR_MESSAGES))
             return
 
         # Build the smart form data
@@ -347,7 +447,7 @@ def handle_reaction_added(event, client):
         if not form_files:
             logger.error("Failed to build form files")
             _update_or_post(client, channel, message_ts, thinking_msg,
-                           "❌ Couldn't process the image files.")
+                           random.choice(GENERATION_FAILED_MESSAGES))
             return
 
         fields = TEMPLATE_FIELDS.get(template, ["image"])
@@ -371,29 +471,22 @@ def handle_reaction_added(event, client):
         except requests.Timeout:
             logger.error("MakeSweet request timed out")
             _update_or_post(client, channel, message_ts, thinking_msg,
-                           "⏱️ GIF generation timed out — the server might be waking up. Try again in a minute!")
+                           random.choice(TIMEOUT_MESSAGES))
             return
         except requests.ConnectionError:
             logger.error("Could not connect to MakeSweet server")
             _update_or_post(client, channel, message_ts, thinking_msg,
-                           "🔌 Couldn't reach the GIF server. It might be restarting — try again in a minute!")
+                           random.choice(CONNECTION_ERROR_MESSAGES))
             return
 
         if gif_response.status_code != 200:
             logger.error(f"MakeSweet error: {gif_response.status_code} - {gif_response.text[:200]}")
             _update_or_post(client, channel, message_ts, thinking_msg,
-                           f"❌ GIF generation failed (error {gif_response.status_code}). Try a different template!")
+                           random.choice(GENERATION_FAILED_MESSAGES))
             return
 
-        # Build a fun reply message
-        template_names = {
-            "heart-locket": "💖 Heart Locket",
-            "billboard": "🏙️ Billboard",
-            "flag": "🏳️ Flag",
-            "flying-bear": "🐻 Flying Bear",
-            "nesting-doll": "🪆 Nesting Doll",
-        }
-        display_name = template_names.get(template, template)
+        # Pick a fun success message for this template
+        success_msg = random.choice(SUCCESS_MESSAGES.get(template, ["✨ here u go"]))
 
         # Delete the "working on it" message
         if thinking_msg:
@@ -414,10 +507,10 @@ def handle_reaction_added(event, client):
                 {
                     "content": gif_response.content,
                     "filename": f"{template}.gif",
-                    "title": display_name,
+                    "title": template,
                 }
             ],
-            initial_comment=f"✨ {display_name}",
+            initial_comment=success_msg,
         )
 
         logger.info("GIF posted successfully!")
@@ -429,7 +522,7 @@ def handle_reaction_added(event, client):
             client.chat_postMessage(
                 channel=channel,
                 thread_ts=message_ts,
-                text="😵 Something went wrong generating the GIF. Try again!",
+                text=random.choice(GENERIC_ERROR_MESSAGES),
             )
         except Exception:
             pass
