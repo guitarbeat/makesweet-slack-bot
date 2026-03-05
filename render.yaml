@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: makesweet-slack-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_APP_TOKEN
+        sync: false
+      - key: MAKESWEET_URL
+        value: https://makesweet-server.onrender.com
