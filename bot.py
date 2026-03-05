@@ -1,4 +1,5 @@
 import os
+import io
 import logging
 import requests
 from slack_bolt import App
@@ -41,7 +42,6 @@ EMOJI_TEMPLATE_MAP = {
 }
 
 # Template -> form field configuration
-# Some templates need multiple image fields
 TEMPLATE_FIELDS = {
     "heart-locket": ["image-left", "image-right"],
     "billboard": ["image"],
@@ -53,6 +53,156 @@ TEMPLATE_FIELDS = {
 # Track processed reactions to avoid duplicates
 processed_reactions = set()
 MAX_PROCESSED_SIZE = 10000
+
+
+def download_image(url, headers=None):
+    """Download an image and return the bytes, or None on failure."""
+    try:
+        resp = requests.get(url, headers=headers or {}, timeout=30)
+        if resp.status_code == 200 and len(resp.content) > 0:
+            return resp.content
+    except Exception as e:
+        logger.warning(f"Failed to download image from {url}: {e}")
+    return None
+
+
+def get_user_avatar(client, user_id):
+    """Fetch a user's Slack profile picture."""
+    try:
+        user_info = client.users_info(user=user_id)
+        profile = user_info["user"]["profile"]
+        # Try to get the largest available avatar
+        avatar_url = (
+            profile.get("image_512")
+            or profile.get("image_192")
+            or profile.get("image_72")
+            or profile.get("image_48")
+        )
+        if avatar_url:
+            return download_image(avatar_url)
+    except Exception as e:
+        logger.warning(f"Failed to get avatar for user {user_id}: {e}")
+    return None
+
+
+def get_message_poster_avatar(client, message):
+    """Get the avatar of the person who posted the message."""
+    user_id = message.get("user")
+    if user_id:
+        return get_user_avatar(client, user_id)
+    return None
+
+
+def collect_images(client, message, reactor_user_id):
+    """
+    Collect images from a message, plus the reactor's and poster's avatars.
+    Returns a dict with keys:
+      - "message_images": list of image bytes from the message
+      - "reactor_avatar": bytes or None
+      - "poster_avatar": bytes or None
+    """
+    bot_token = os.environ["SLACK_BOT_TOKEN"]
+    auth_headers = {"Authorization": f"Bearer {bot_token}"}
+
+    # Get all images from the message
+    files = message.get("files", [])
+    image_files = [f for f in files if f.get("mimetype", "").startswith("image/")]
+
+    message_images = []
+    for img_file in image_files:
+        url = img_file.get("url_private_download") or img_file.get("url_private")
+        if url:
+            data = download_image(url, headers=auth_headers)
+            if data:
+                message_images.append(data)
+
+    # Get avatars
+    reactor_avatar = get_user_avatar(client, reactor_user_id)
+    poster_avatar = get_message_poster_avatar(client, message)
+
+    return {
+        "message_images": message_images,
+        "reactor_avatar": reactor_avatar,
+        "poster_avatar": poster_avatar,
+    }
+
+
+def build_form_files(template, images_info):
+    """
+    Smartly assign images to form fields based on what's available.
+
+    Strategy for multi-image templates:
+    - heart-locket (2 slots): message image + reactor's avatar
+    - nesting-doll (3 slots): message image + reactor avatar + poster avatar
+
+    Falls back gracefully:
+    - Multiple message images? Use those first.
+    - Only one image? Mix in avatars.
+    - Still not enough? Duplicate what we have.
+    """
+    fields = TEMPLATE_FIELDS.get(template, ["image"])
+    num_needed = len(fields)
+
+    msg_images = images_info["message_images"]
+    reactor_avatar = images_info["reactor_avatar"]
+    poster_avatar = images_info["poster_avatar"]
+
+    if num_needed == 1:
+        # Simple: just use the first message image
+        img = msg_images[0] if msg_images else None
+        if not img:
+            return None
+        return {fields[0]: ("image.png", img, "image/png")}
+
+    # Build a pool of available images in priority order
+    pool = []
+
+    if num_needed == 2:
+        # heart-locket: message image on left, reactor avatar on right
+        if msg_images:
+            pool.append(msg_images[0])
+        if reactor_avatar:
+            pool.append(reactor_avatar)
+        # If we have 2+ message images, prefer those
+        if len(msg_images) >= 2:
+            pool = msg_images[:2]
+        # Still need more? Add poster avatar or duplicate
+        if len(pool) < 2 and poster_avatar and poster_avatar not in pool:
+            pool.append(poster_avatar)
+
+    elif num_needed == 3:
+        # nesting-doll: message images first, then avatars
+        if len(msg_images) >= 3:
+            pool = msg_images[:3]
+        elif len(msg_images) >= 2:
+            pool = msg_images[:2]
+            if reactor_avatar:
+                pool.append(reactor_avatar)
+            elif poster_avatar:
+                pool.append(poster_avatar)
+        elif len(msg_images) == 1:
+            pool.append(msg_images[0])
+            if reactor_avatar:
+                pool.append(reactor_avatar)
+            if poster_avatar and poster_avatar != reactor_avatar:
+                pool.append(poster_avatar)
+        else:
+            # No message images at all
+            return None
+
+    # Pad pool by duplicating if we still don't have enough
+    while len(pool) < num_needed:
+        pool.append(pool[0] if pool else None)
+
+    if not pool or pool[0] is None:
+        return None
+
+    # Map images to form fields
+    form_files = {}
+    for i, field_name in enumerate(fields):
+        form_files[field_name] = ("image.png", pool[i], "image/png")
+
+    return form_files
 
 
 @app.event("reaction_added")
@@ -70,7 +220,7 @@ def handle_reaction_added(event, client):
 
         channel = item["channel"]
         message_ts = item["ts"]
-        user = event["user"]
+        reactor_user = event["user"]
 
         # Deduplicate
         reaction_key = f"{channel}:{message_ts}:{template}"
@@ -79,13 +229,12 @@ def handle_reaction_added(event, client):
             return
         processed_reactions.add(reaction_key)
 
-        # Prevent unbounded memory growth
         if len(processed_reactions) > MAX_PROCESSED_SIZE:
             processed_reactions.clear()
 
         logger.info(f"Processing reaction '{reaction}' -> template '{template}' in {channel}")
 
-        # Fetch the message to find images
+        # Fetch the message
         result = client.conversations_history(
             channel=channel,
             latest=message_ts,
@@ -99,45 +248,40 @@ def handle_reaction_added(event, client):
 
         message = result["messages"][0]
 
-        # Find image files
+        # Check for images
         files = message.get("files", [])
-        image_files = [
-            f
-            for f in files
-            if f.get("mimetype", "").startswith("image/")
-        ]
+        has_images = any(f.get("mimetype", "").startswith("image/") for f in files)
 
-        if not image_files:
+        if not has_images:
             logger.info("No image files in message, skipping")
             return
 
-        image_file = image_files[0]
+        # Collect all available images (message images + avatars)
+        logger.info("Collecting images (message files + user avatars)...")
+        images_info = collect_images(client, message, reactor_user)
 
-        # Download the image from Slack
-        image_url = image_file.get("url_private_download") or image_file.get("url_private")
-        if not image_url:
-            logger.warning("No download URL for image")
+        if not images_info["message_images"]:
+            logger.warning("Failed to download any message images")
             return
 
-        logger.info("Downloading image from Slack...")
-        image_response = requests.get(
-            image_url,
-            headers={"Authorization": f"Bearer {os.environ['SLACK_BOT_TOKEN']}"},
-            timeout=30,
-        )
-
-        if image_response.status_code != 200:
-            logger.error(f"Failed to download image: {image_response.status_code}")
+        # Build the smart form data
+        form_files = build_form_files(template, images_info)
+        if not form_files:
+            logger.error("Failed to build form files")
             return
 
-        # Build the form fields based on the template
         fields = TEMPLATE_FIELDS.get(template, ["image"])
-        form_files = {}
-        for field_name in fields:
-            form_files[field_name] = ("image.png", image_response.content, "image/png")
+        source_info = []
+        if len(fields) > 1:
+            source_info.append(f"{len(images_info['message_images'])} message image(s)")
+            if images_info["reactor_avatar"]:
+                source_info.append("reactor's avatar")
+            if images_info["poster_avatar"]:
+                source_info.append("poster's avatar")
+            logger.info(f"Using: {', '.join(source_info)}")
 
-        # Send to MakeSweet server
-        logger.info(f"Generating {template} GIF via MakeSweet ({len(fields)} image field(s))...")
+        # Generate the GIF
+        logger.info(f"Generating {template} GIF via MakeSweet...")
         gif_response = requests.post(
             f"{MAKESWEET_URL}/api/gif/{template}",
             files=form_files,
@@ -148,7 +292,17 @@ def handle_reaction_added(event, client):
             logger.error(f"MakeSweet error: {gif_response.status_code} - {gif_response.text[:200]}")
             return
 
-        # Upload GIF to Slack as a reply
+        # Build a fun reply message
+        template_names = {
+            "heart-locket": "💖 Heart Locket",
+            "billboard": "🏙️ Billboard",
+            "flag": "🏳️ Flag",
+            "flying-bear": "🐻 Flying Bear",
+            "nesting-doll": "🪆 Nesting Doll",
+        }
+        display_name = template_names.get(template, template)
+
+        # Upload GIF to Slack as a threaded reply
         logger.info("Uploading GIF to Slack...")
         client.files_upload_v2(
             channel=channel,
@@ -157,10 +311,10 @@ def handle_reaction_added(event, client):
                 {
                     "content": gif_response.content,
                     "filename": f"{template}.gif",
-                    "title": f"{template}",
+                    "title": display_name,
                 }
             ],
-            initial_comment=f"✨ Here's your *{template}* GIF!",
+            initial_comment=f"✨ {display_name}",
         )
 
         logger.info("GIF posted successfully!")
@@ -169,7 +323,7 @@ def handle_reaction_added(event, client):
         logger.error(f"Error processing reaction: {e}", exc_info=True)
 
 
-# Health check endpoint so Render keeps the service alive
+# Health check endpoint for Render
 flask_app = Flask(__name__)
 
 
@@ -185,12 +339,10 @@ def start_flask():
 
 
 if __name__ == "__main__":
-    # Start Flask health check in background thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
     logger.info("Health check server started")
 
-    # Start Socket Mode handler (blocks main thread)
     logger.info("Starting MakeSweet Slack Bot in Socket Mode...")
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
