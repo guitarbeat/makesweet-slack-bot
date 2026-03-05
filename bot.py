@@ -36,12 +36,18 @@ EMOJI_TEMPLATE_MAP = {
     # Flying Bear 🐻
     "bear": "flying-bear",
     "teddy_bear": "flying-bear",
-    # Circuit 🔌
-    "electric_plug": "circuit",
-    "computer": "circuit",
-    "desktop_computer": "circuit",
     # Nesting Doll 🪆
     "nesting_dolls": "nesting-doll",
+}
+
+# Template -> form field configuration
+# Some templates need multiple image fields
+TEMPLATE_FIELDS = {
+    "heart-locket": ["image-left", "image-right"],
+    "billboard": ["image"],
+    "flag": ["image"],
+    "flying-bear": ["image"],
+    "nesting-doll": ["image-left", "image-mid", "image-right"],
 }
 
 # Track processed reactions to avoid duplicates
@@ -124,11 +130,17 @@ def handle_reaction_added(event, client):
             logger.error(f"Failed to download image: {image_response.status_code}")
             return
 
+        # Build the form fields based on the template
+        fields = TEMPLATE_FIELDS.get(template, ["image"])
+        form_files = {}
+        for field_name in fields:
+            form_files[field_name] = ("image.png", image_response.content, "image/png")
+
         # Send to MakeSweet server
-        logger.info(f"Generating {template} GIF via MakeSweet...")
+        logger.info(f"Generating {template} GIF via MakeSweet ({len(fields)} image field(s))...")
         gif_response = requests.post(
             f"{MAKESWEET_URL}/api/gif/{template}",
-            files={"images": ("image.png", image_response.content, "image/png")},
+            files=form_files,
             timeout=120,
         )
 
