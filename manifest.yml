@@ -1,0 +1,26 @@
+display_information:
+  name: MakeSweet GIF Bot
+  description: React to images with emojis to generate fun animated GIFs!
+  background_color: "#FF6B6B"
+features:
+  bot_user:
+    display_name: MakeSweet
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - reactions:read
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - files:read
+      - files:write
+      - chat:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - reaction_added
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
