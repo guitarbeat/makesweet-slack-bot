@@ -93,6 +93,43 @@ def get_message_poster_avatar(client, message):
     return None
 
 
+def fetch_message(client, channel, message_ts):
+    """
+    Fetch a message by timestamp. Tries conversations_history first (top-level),
+    then falls back to conversations_replies (thread replies).
+    """
+    # Try top-level message first
+    try:
+        result = client.conversations_history(
+            channel=channel,
+            latest=message_ts,
+            inclusive=True,
+            limit=1,
+        )
+        messages = result.get("messages", [])
+        if messages and messages[0].get("ts") == message_ts:
+            return messages[0]
+    except Exception as e:
+        logger.warning(f"conversations_history failed: {e}")
+
+    # Fall back to thread replies — the reacted message might be inside a thread
+    try:
+        result = client.conversations_replies(
+            channel=channel,
+            ts=message_ts,
+            inclusive=True,
+            limit=1,
+        )
+        messages = result.get("messages", [])
+        for msg in messages:
+            if msg.get("ts") == message_ts:
+                return msg
+    except Exception as e:
+        logger.warning(f"conversations_replies failed: {e}")
+
+    return None
+
+
 def collect_images(client, message, reactor_user_id):
     """
     Collect images from a message, plus the reactor's and poster's avatars.
@@ -221,16 +258,10 @@ def handle_message(event, client):
         channel = event["channel"]
 
         # Check if the parent message has images
-        result = client.conversations_history(
-            channel=channel,
-            latest=thread_ts,
-            inclusive=True,
-            limit=1,
-        )
-        if not result.get("messages"):
+        parent = fetch_message(client, channel, thread_ts)
+        if not parent:
             return
 
-        parent = result["messages"][0]
         files = parent.get("files", [])
         has_images = any(f.get("mimetype", "").startswith("image/") for f in files)
 
@@ -276,19 +307,12 @@ def handle_reaction_added(event, client):
 
         logger.info(f"Processing reaction '{reaction}' -> template '{template}' in {channel}")
 
-        # Fetch the message
-        result = client.conversations_history(
-            channel=channel,
-            latest=message_ts,
-            inclusive=True,
-            limit=1,
-        )
+        # Fetch the message (works for both top-level and thread replies)
+        message = fetch_message(client, channel, message_ts)
 
-        if not result.get("messages"):
-            logger.warning("No messages found")
+        if not message:
+            logger.warning("Could not find the reacted message")
             return
-
-        message = result["messages"][0]
 
         # Check for images
         files = message.get("files", [])
@@ -298,18 +322,32 @@ def handle_reaction_added(event, client):
             logger.info("No image files in message, skipping")
             return
 
+        # Post a "working on it" indicator
+        try:
+            thinking_msg = client.chat_postMessage(
+                channel=channel,
+                thread_ts=message_ts,
+                text="🎨 Generating GIF...",
+            )
+        except Exception:
+            thinking_msg = None
+
         # Collect all available images (message images + avatars)
         logger.info("Collecting images (message files + user avatars)...")
         images_info = collect_images(client, message, reactor_user)
 
         if not images_info["message_images"]:
             logger.warning("Failed to download any message images")
+            _update_or_post(client, channel, message_ts, thinking_msg,
+                           "❌ Couldn't download the image. Make sure I have access to this channel!")
             return
 
         # Build the smart form data
         form_files = build_form_files(template, images_info)
         if not form_files:
             logger.error("Failed to build form files")
+            _update_or_post(client, channel, message_ts, thinking_msg,
+                           "❌ Couldn't process the image files.")
             return
 
         fields = TEMPLATE_FIELDS.get(template, ["image"])
@@ -324,14 +362,27 @@ def handle_reaction_added(event, client):
 
         # Generate the GIF
         logger.info(f"Generating {template} GIF via MakeSweet...")
-        gif_response = requests.post(
-            f"{MAKESWEET_URL}/api/gif/{template}",
-            files=form_files,
-            timeout=120,
-        )
+        try:
+            gif_response = requests.post(
+                f"{MAKESWEET_URL}/api/gif/{template}",
+                files=form_files,
+                timeout=120,
+            )
+        except requests.Timeout:
+            logger.error("MakeSweet request timed out")
+            _update_or_post(client, channel, message_ts, thinking_msg,
+                           "⏱️ GIF generation timed out — the server might be waking up. Try again in a minute!")
+            return
+        except requests.ConnectionError:
+            logger.error("Could not connect to MakeSweet server")
+            _update_or_post(client, channel, message_ts, thinking_msg,
+                           "🔌 Couldn't reach the GIF server. It might be restarting — try again in a minute!")
+            return
 
         if gif_response.status_code != 200:
             logger.error(f"MakeSweet error: {gif_response.status_code} - {gif_response.text[:200]}")
+            _update_or_post(client, channel, message_ts, thinking_msg,
+                           f"❌ GIF generation failed (error {gif_response.status_code}). Try a different template!")
             return
 
         # Build a fun reply message
@@ -343,6 +394,16 @@ def handle_reaction_added(event, client):
             "nesting-doll": "🪆 Nesting Doll",
         }
         display_name = template_names.get(template, template)
+
+        # Delete the "working on it" message
+        if thinking_msg:
+            try:
+                client.chat_delete(
+                    channel=channel,
+                    ts=thinking_msg["ts"],
+                )
+            except Exception:
+                pass  # Bot might not have permission to delete
 
         # Upload GIF to Slack as a threaded reply
         logger.info("Uploading GIF to Slack...")
@@ -363,6 +424,37 @@ def handle_reaction_added(event, client):
 
     except Exception as e:
         logger.error(f"Error processing reaction: {e}", exc_info=True)
+        # Try to notify the user something went wrong
+        try:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=message_ts,
+                text="😵 Something went wrong generating the GIF. Try again!",
+            )
+        except Exception:
+            pass
+
+
+def _update_or_post(client, channel, thread_ts, thinking_msg, text):
+    """Update the thinking message with an error, or post a new one."""
+    if thinking_msg:
+        try:
+            client.chat_update(
+                channel=channel,
+                ts=thinking_msg["ts"],
+                text=text,
+            )
+            return
+        except Exception:
+            pass
+    try:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=text,
+        )
+    except Exception:
+        pass
 
 
 # Health check endpoint for Render
