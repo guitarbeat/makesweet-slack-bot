@@ -205,6 +205,48 @@ def build_form_files(template, images_info):
     return form_files
 
 
+@app.event("message")
+def handle_message(event, client):
+    """If someone replies 'how' to a message with images, reply with the supported emojis."""
+    try:
+        text = (event.get("text") or "").strip().lower()
+        if text != "how":
+            return
+
+        # Only respond in threads (replies to a message)
+        thread_ts = event.get("thread_ts")
+        if not thread_ts:
+            return
+
+        channel = event["channel"]
+
+        # Check if the parent message has images
+        result = client.conversations_history(
+            channel=channel,
+            latest=thread_ts,
+            inclusive=True,
+            limit=1,
+        )
+        if not result.get("messages"):
+            return
+
+        parent = result["messages"][0]
+        files = parent.get("files", [])
+        has_images = any(f.get("mimetype", "").startswith("image/") for f in files)
+
+        if not has_images:
+            return
+
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text="💖 🏙️ 🏳️ 🐻 🪆",
+        )
+
+    except Exception as e:
+        logger.error(f"Error handling 'how' message: {e}", exc_info=True)
+
+
 @app.event("reaction_added")
 def handle_reaction_added(event, client):
     try:
