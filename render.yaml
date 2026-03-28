@@ -9,4 +9,8 @@ services:
       - key: SLACK_APP_TOKEN
         sync: false
       - key: MAKESWEET_URL
-        value: https://makesweet-server.onrender.com
+        value: http://localhost:8080
+      - key: SAVE_IMAGE_FOLDER
+        value: /makesweet/images
+      - key: GIN_MODE
+        value: release
