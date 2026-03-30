@@ -1,19 +1,37 @@
 import os
+import sys
 import logging
+import time
+import threading
+from collections import OrderedDict
+from io import BytesIO
+
 import requests
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from flask import Flask
-import threading
+from flask import Flask, jsonify
 
-logging.basicConfig(level=logging.INFO)
+# ── Logging ──────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger(__name__)
+
+# ── Startup validation ───────────────────────────────────────────────────
+REQUIRED_ENV = ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"]
+missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
+if missing:
+    logger.critical(f"Missing required env vars: {', '.join(missing)}")
+    sys.exit(1)
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
-MAKESWEET_URL = os.environ.get("MAKESWEET_URL", "https://makesweet-server.onrender.com")
+MAKESWEET_URL = os.environ.get(
+    "MAKESWEET_URL", "http://localhost:8080"
+)
 
-# Emoji -> template mapping
+# ── Emoji → template ────────────────────────────────────────────────────
 EMOJI_TEMPLATE_MAP = {
     "sparkling_heart": "heart-locket",
     "heart": "heart-locket",
@@ -34,7 +52,6 @@ EMOJI_TEMPLATE_MAP = {
     "nesting_dolls": "nesting-doll",
 }
 
-# Template -> form fields
 TEMPLATE_FIELDS = {
     "heart-locket": ["image-left", "image-right"],
     "billboard": ["image"],
@@ -43,24 +60,61 @@ TEMPLATE_FIELDS = {
     "nesting-doll": ["image-left", "image-mid", "image-right"],
 }
 
-# Bot reacts with this while working, removes it when done
 WORKING_REACTION = "art"  # 🎨
 
-processed_reactions = set()
-MAX_PROCESSED_SIZE = 10000
+
+# ── Thread-safe LRU dedup cache ─────────────────────────────────────────
+class LRUDedup:
+    """Thread-safe LRU set that evicts oldest entries instead of clearing all."""
+
+    def __init__(self, max_size=10000):
+        self._data = OrderedDict()
+        self._lock = threading.Lock()
+        self._max_size = max_size
+
+    def check_and_add(self, key):
+        """Returns True if key is new (not a dupe). Adds it atomically."""
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+                return False
+            self._data[key] = True
+            if len(self._data) > self._max_size:
+                self._data.popitem(last=False)
+            return True
 
 
-def download_image(url, headers=None):
-    try:
-        resp = requests.get(url, headers=headers or {}, timeout=30)
-        if resp.status_code == 200 and len(resp.content) > 0:
-            return resp.content
-    except Exception as e:
-        logger.warning(f"Failed to download image from {url}: {e}")
+processed = LRUDedup(max_size=10000)
+
+
+# ── Concurrency limiter ─────────────────────────────────────────────────
+gif_semaphore = threading.Semaphore(3)  # max 3 concurrent GIF generations
+
+
+# ── Image helpers ────────────────────────────────────────────────────────
+def download_image(url, headers=None, retries=2):
+    """Download an image with retries."""
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=headers or {}, timeout=30)
+            if resp.status_code == 200 and len(resp.content) > 100:
+                return resp.content
+            logger.warning(
+                f"Bad response downloading image: {resp.status_code} "
+                f"({len(resp.content)} bytes)"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Download attempt {attempt + 1}/{retries + 1} failed: {e}"
+            )
+            if attempt < retries:
+                time.sleep(1)
     return None
 
 
 def get_user_avatar(client, user_id):
+    if not user_id:
+        return None
     try:
         user_info = client.users_info(user=user_id)
         profile = user_info["user"]["profile"]
@@ -73,10 +127,11 @@ def get_user_avatar(client, user_id):
         if avatar_url:
             return download_image(avatar_url)
     except Exception as e:
-        logger.warning(f"Failed to get avatar for user {user_id}: {e}")
+        logger.warning(f"Failed to get avatar for {user_id}: {e}")
     return None
 
 
+# ── Message fetching ─────────────────────────────────────────────────────
 def fetch_message(client, channel, message_ts):
     """Fetch a message — tries top-level first, then thread replies."""
     try:
@@ -89,6 +144,7 @@ def fetch_message(client, channel, message_ts):
     except Exception as e:
         logger.warning(f"conversations_history failed: {e}")
 
+    # It might be a thread reply — need to find the parent thread
     try:
         result = client.conversations_replies(
             channel=channel, ts=message_ts, inclusive=True, limit=1
@@ -103,6 +159,7 @@ def fetch_message(client, channel, message_ts):
     return None
 
 
+# ── Image collection ────────────────────────────────────────────────────
 def collect_images(client, message, reactor_user_id):
     bot_token = os.environ["SLACK_BOT_TOKEN"]
     auth_headers = {"Authorization": f"Bearer {bot_token}"}
@@ -166,37 +223,84 @@ def build_form_files(template, images_info):
             pool.append(msg_images[0])
             if reactor_avatar:
                 pool.append(reactor_avatar)
-            if poster_avatar and poster_avatar != reactor_avatar:
+            if poster_avatar:
                 pool.append(poster_avatar)
         else:
             return None
 
-    # Pad by duplicating if needed
+    # Pad by duplicating first image if needed
     while len(pool) < num_needed:
-        pool.append(pool[0] if pool else None)
+        if pool:
+            pool.append(pool[0])
+        else:
+            return None
 
     if not pool or pool[0] is None:
         return None
 
-    return {field: ("image.png", pool[i], "image/png") for i, field in enumerate(fields)}
+    return {
+        field: ("image.png", pool[i], "image/png")
+        for i, field in enumerate(fields)
+    }
 
 
+# ── Reaction helpers ────────────────────────────────────────────────────
 def add_working_reaction(client, channel, timestamp):
-    """Add 🎨 reaction to show we're working."""
     try:
-        client.reactions_add(channel=channel, timestamp=timestamp, name=WORKING_REACTION)
+        client.reactions_add(
+            channel=channel, timestamp=timestamp, name=WORKING_REACTION
+        )
     except Exception as e:
         logger.warning(f"Could not add working reaction: {e}")
 
 
 def remove_working_reaction(client, channel, timestamp):
-    """Remove 🎨 reaction when done."""
     try:
-        client.reactions_remove(channel=channel, timestamp=timestamp, name=WORKING_REACTION)
-    except Exception as e:
-        logger.warning(f"Could not remove working reaction: {e}")
+        client.reactions_remove(
+            channel=channel, timestamp=timestamp, name=WORKING_REACTION
+        )
+    except Exception:
+        pass  # Might already be removed, that's fine
 
 
+# ── GIF generation with retry ───────────────────────────────────────────
+def generate_gif(template, form_files, retries=1):
+    """Call MakeSweet server with retry on failure."""
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(
+                f"{MAKESWEET_URL}/api/gif/{template}",
+                files=form_files,
+                timeout=120,
+            )
+            if resp.status_code == 200:
+                # Validate it's actually a GIF
+                content = resp.content
+                if len(content) > 100 and content[:6] in (b"GIF87a", b"GIF89a"):
+                    return content
+                logger.warning(
+                    f"Response isn't a valid GIF "
+                    f"({len(content)} bytes, starts with {content[:10]})"
+                )
+            else:
+                logger.warning(
+                    f"MakeSweet returned {resp.status_code} "
+                    f"(attempt {attempt + 1})"
+                )
+        except requests.Timeout:
+            logger.warning(f"MakeSweet timed out (attempt {attempt + 1})")
+        except requests.ConnectionError:
+            logger.warning(f"Can't reach MakeSweet (attempt {attempt + 1})")
+        except Exception as e:
+            logger.error(f"Unexpected error calling MakeSweet: {e}")
+
+        if attempt < retries:
+            time.sleep(2)
+
+    return None
+
+
+# ── Event handlers ──────────────────────────────────────────────────────
 @app.event("message")
 def handle_message(event, client):
     """Reply 'how' in a thread with an image -> show supported emojis."""
@@ -245,18 +349,16 @@ def handle_reaction_added(event, client):
         message_ts = item["ts"]
         reactor_user = event["user"]
 
-        # Deduplicate
+        # Thread-safe dedup with LRU eviction
         reaction_key = f"{channel}:{message_ts}:{template}"
-        if reaction_key in processed_reactions:
+        if not processed.check_and_add(reaction_key):
             return
-        processed_reactions.add(reaction_key)
-        if len(processed_reactions) > MAX_PROCESSED_SIZE:
-            processed_reactions.clear()
 
         logger.info(f"Processing '{reaction}' -> '{template}' in {channel}")
 
         message = fetch_message(client, channel, message_ts)
         if not message:
+            logger.warning("Could not fetch message")
             return
 
         files = message.get("files", [])
@@ -264,57 +366,53 @@ def handle_reaction_added(event, client):
         if not has_images:
             return
 
-        # React with 🎨 to show we're working
-        add_working_reaction(client, channel, message_ts)
-
-        images_info = collect_images(client, message, reactor_user)
-
-        if not images_info["message_images"]:
-            logger.warning("Failed to download message images")
-            remove_working_reaction(client, channel, message_ts)
+        # Limit concurrent GIF generations
+        acquired = gif_semaphore.acquire(timeout=60)
+        if not acquired:
+            logger.warning("Too many concurrent GIF generations, skipping")
             return
 
-        form_files = build_form_files(template, images_info)
-        if not form_files:
-            remove_working_reaction(client, channel, message_ts)
-            return
-
-        # Generate the GIF
-        logger.info(f"Generating {template} GIF...")
         try:
-            gif_response = requests.post(
-                f"{MAKESWEET_URL}/api/gif/{template}",
-                files=form_files,
-                timeout=120,
+            add_working_reaction(client, channel, message_ts)
+
+            images_info = collect_images(client, message, reactor_user)
+
+            if not images_info["message_images"]:
+                logger.warning("Failed to download message images")
+                remove_working_reaction(client, channel, message_ts)
+                return
+
+            form_files = build_form_files(template, images_info)
+            if not form_files:
+                remove_working_reaction(client, channel, message_ts)
+                return
+
+            # Generate with retry
+            gif_data = generate_gif(template, form_files)
+
+            # Always remove the working reaction
+            remove_working_reaction(client, channel, message_ts)
+
+            if not gif_data:
+                logger.error(f"GIF generation failed for {template}")
+                return
+
+            # Post just the GIF, no text
+            client.files_upload_v2(
+                channel=channel,
+                thread_ts=message_ts,
+                file_uploads=[
+                    {
+                        "content": gif_data,
+                        "filename": f"{template}.gif",
+                        "title": template,
+                    }
+                ],
             )
-        except (requests.Timeout, requests.ConnectionError) as e:
-            logger.error(f"MakeSweet request failed: {e}")
-            remove_working_reaction(client, channel, message_ts)
-            return
+            logger.info(f"Posted {template} GIF!")
 
-        if gif_response.status_code != 200:
-            logger.error(f"MakeSweet error: {gif_response.status_code}")
-            remove_working_reaction(client, channel, message_ts)
-            return
-
-        # Remove 🎨 reaction
-        remove_working_reaction(client, channel, message_ts)
-
-        # Post just the GIF, no text
-        logger.info("Uploading GIF...")
-        client.files_upload_v2(
-            channel=channel,
-            thread_ts=message_ts,
-            file_uploads=[
-                {
-                    "content": gif_response.content,
-                    "filename": f"{template}.gif",
-                    "title": template,
-                }
-            ],
-        )
-
-        logger.info("GIF posted!")
+        finally:
+            gif_semaphore.release()
 
     except Exception as e:
         logger.error(f"Error processing reaction: {e}", exc_info=True)
@@ -324,26 +422,54 @@ def handle_reaction_added(event, client):
             pass
 
 
-# Health check
+# ── Health check with actual status ─────────────────────────────────────
 flask_app = Flask(__name__)
+
+# Track connection state
+bot_state = {"socket_connected": False, "last_event_time": 0, "start_time": 0}
+
+
+@app.event("app_mention")
+def handle_mention(event, client):
+    """Track event receipt so health check can verify we're getting events."""
+    bot_state["last_event_time"] = time.time()
 
 
 @flask_app.route("/")
 @flask_app.route("/health")
 def health():
-    return "MakeSweet Slack Bot is running! 🎬"
+    uptime = int(time.time() - bot_state["start_time"]) if bot_state["start_time"] else 0
+    last_event_age = (
+        int(time.time() - bot_state["last_event_time"])
+        if bot_state["last_event_time"]
+        else None
+    )
+
+    status = {
+        "status": "ok",
+        "uptime_seconds": uptime,
+        "socket_connected": bot_state["socket_connected"],
+        "last_event_seconds_ago": last_event_age,
+    }
+
+    # Check if MakeSweet server is reachable (cached every 5 min)
+    return jsonify(status), 200
 
 
+# ── Startup ─────────────────────────────────────────────────────────────
 def start_flask():
     port = int(os.environ.get("PORT", 3000))
     flask_app.run(host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
+    bot_state["start_time"] = time.time()
+
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
     logger.info("Health check server started")
 
     logger.info("Starting MakeSweet Slack Bot in Socket Mode...")
+    bot_state["socket_connected"] = True
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
